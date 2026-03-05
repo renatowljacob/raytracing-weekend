@@ -4,7 +4,7 @@ import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
-import os "core:os/os2"
+import "core:os"
 import "core:strings"
 import "core:time"
 
