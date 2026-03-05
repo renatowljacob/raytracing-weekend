@@ -3,6 +3,7 @@ package rtweekend
 import "core:fmt"
 import "core:math"
 import "core:math/linalg"
+import "core:math/rand"
 import os "core:os/os2"
 import "core:strings"
 import "core:time"
@@ -66,7 +67,7 @@ main :: proc() {
 
 	image: Image
 	image.aspect_ratio = 16.0 / 9.0
-	image.width = 400
+	image.width = 800
 	image.height = int(f32(image.width) / image.aspect_ratio)
 
 	max_line_len := 12
@@ -97,8 +98,8 @@ main :: proc() {
 		delta_x = viewport_x / f32(image.width),
 		delta_y = viewport_y / f32(image.height),
 	}
-	camera.samples_per_pixel = 10
-	camera.pixel_samples_scale = 1 * f32(camera.samples_per_pixel)
+	camera.samples_per_pixel = 30
+	camera.pixel_samples_scale = 1 / f32(camera.samples_per_pixel)
 
 	focal_length: f32 = 1
 	viewport_upper_left :=
@@ -111,80 +112,96 @@ main :: proc() {
 	}
 
 	// Render image
-	for i in 0 ..< image.height {
-		fmt.printf("\rLines remaining: %v", image.height - i, flush = false)
+	for y in 0 ..< image.height {
+		fmt.printf("\rLines remaining: %v ", image.height - y, flush = false)
 
-		for j in 0 ..< image.width {
-			ray := Ray {
-				origin    = camera.center,
-				direction = camera.pixel.first + (f32(j) * camera.pixel.delta_x) + (f32(i) * camera.pixel.delta_y) - camera.center,
-			}
-			intersection: Ray_Intersection
-			pixel: Color3
+		for x in 0 ..< image.width {
+			sampled_pixel: Color3
 
-			tmin: f32 = 0
-			tmax := math.INF_F32
+			for sample in 0 ..< camera.samples_per_pixel {
+				offset := Vec3{rand.float32() - 0.5, rand.float32() - 0.5, 0}
+				pixel_sample :=
+					camera.pixel.first +
+					((f32(x) + offset.x) * camera.pixel.delta_x) +
+					((f32(y) + offset.y) * camera.pixel.delta_y)
+				ray: Ray
+				ray.origin = camera.center
+				ray.direction = pixel_sample - ray.origin
 
-			// Detect closest intersection
-			for sphere in spheres {
-				distance := sphere.center - ray.origin
-				a := linalg.length2(ray.direction)
-				c := linalg.length2(distance) - sphere.radius * sphere.radius
-				h := linalg.dot(ray.direction, distance)
-				discriminant := h * h - a * c
+				pixel: Color3
+				intersection: Ray_Intersection
 
-				// Check for intersections
-				if discriminant < 0 {
-					continue
-				}
+				tmin: f32 = 0
+				tmax := math.INF_F32
 
-				discriminant_sqrt := linalg.sqrt(discriminant)
-				root := (h - discriminant_sqrt) / a
-				if (root <= tmin || root >= tmax) {
-					root = (h + discriminant_sqrt) / a
-					if (root <= tmin || root >= tmax) {
+				// Detect closest intersection
+				for sphere in spheres {
+					distance := sphere.center - ray.origin
+					a := linalg.length2(ray.direction)
+					c := linalg.length2(distance) - sphere.radius * sphere.radius
+					h := linalg.dot(ray.direction, distance)
+					discriminant := h * h - a * c
+
+					// Check for intersections
+					if discriminant < 0 {
 						continue
+					}
+
+					discriminant_sqrt := linalg.sqrt(discriminant)
+					root := (h - discriminant_sqrt) / a
+					if (root <= tmin || root >= tmax) {
+						root = (h + discriminant_sqrt) / a
+						if (root <= tmin || root >= tmax) {
+							continue
+						}
+					}
+
+					// Intersection closest so far set to upper limit
+					tmax, intersection.t = root, root
+					intersection.point = ray.origin + intersection.t * ray.direction
+					intersection.normal = (intersection.point - sphere.center) / sphere.radius
+
+					// If normal and ray have opposite directions
+					if linalg.dot(intersection.normal, ray.direction) < 0 {
+						intersection.kind = .NORMAL_OPPOSITE
+					} else {
+						intersection.kind = .NORMAL_ALIGNED
 					}
 				}
 
-				// Intersection closest so far set to upper limit
-				tmax, intersection.t = root, root
-				intersection.point = ray.origin + intersection.t * ray.direction
-				intersection.normal = (intersection.point - sphere.center) / sphere.radius
+				#partial switch intersection.kind {
+				case .NO_HIT:
+					normalized_ray := linalg.vector_normalize(ray.direction)
+					t := (normalized_ray.y + 1) * 0.5
 
-				// If normal and ray have opposite directions
-				if linalg.dot(intersection.normal, ray.direction) < 0 {
-					intersection.kind = .NORMAL_OPPOSITE
-				} else {
-					intersection.kind = .NORMAL_ALIGNED
+					// Lerp
+					pixel = (1 - t) * Color3{1, 1, 1} + t * Color3{0.5, 0.7, 1}
+				case:
+					pixel = (intersection.normal + Color3{1, 1, 1}) * 0.5
+				// case .NORMAL_ALIGNED:
+				// case .NORMAL_OPPOSITE:
 				}
+
+				assert(
+					0 < pixel.r &&
+					pixel.r <= 1 &&
+					0 < pixel.g &&
+					pixel.g <= 1 &&
+					0 < pixel.b &&
+					pixel.b <= 1,
+				)
+
+				sampled_pixel += pixel
 			}
 
-			#partial switch intersection.kind {
-			case .NO_HIT:
-				normalized_ray := linalg.vector_normalize(ray.direction)
-				t := (normalized_ray.y + 1) * 0.5
+			sampled_pixel *= 255 * camera.pixel_samples_scale
 
-				// Lerp
-				pixel = (1 - t) * Color3{1, 1, 1} + t * Color3{0.5, 0.7, 1}
-			case:
-				pixel = (intersection.normal + Color3{1, 1, 1}) * 0.5
-			// case .NORMAL_ALIGNED:
-			// case .NORMAL_OPPOSITE:
-			}
-
-			assert(
-				0 < pixel.r &&
-				pixel.r <= 1 &&
-				0 < pixel.g &&
-				pixel.g <= 1 &&
-				0 < pixel.b &&
-				pixel.b <= 1,
+			fmt.sbprintln(
+				&builder,
+				int(sampled_pixel.r),
+				int(sampled_pixel.g),
+				int(sampled_pixel.b),
 			)
-
-			pixel *= 255
-
-			fmt.sbprintln(&builder, int(pixel.r), int(pixel.g), int(pixel.b))
 		}
 	}
 	fmt.println()
