@@ -21,8 +21,8 @@ Camera :: struct {
 		delta_y: Vec3,
 	},
 	center:              Point3,
-	samples_per_pixel:   int,
 	pixel_samples_scale: f64,
+	samples_per_pixel:   int,
 	max_depth:           int,
 }
 
@@ -130,24 +130,24 @@ main :: proc() {
 				ray.origin = camera.center
 				ray.direction = pixel_sample - ray.origin
 
-				pixel := get_ray_color(
+				color := get_ray_color(
 					ray,
 					tmin = 0.001,
 					max_depth = camera.max_depth,
 					spheres = spheres[:],
 				)
-				pixel = {clamp(pixel.r, 0, 1), clamp(pixel.g, 0, 1), clamp(pixel.b, 0, 1)}
-				sampled_pixel += pixel
-
+				sampled_pixel += {clamp(color.r, 0, 1), clamp(color.g, 0, 1), clamp(color.b, 0, 1)}
 			}
 
-			sampled_pixel *= camera.pixel_samples_scale * 255
-			fmt.sbprintln(
-				&builder,
-				int(sampled_pixel.r),
-				int(sampled_pixel.g),
-				int(sampled_pixel.b),
-			)
+			scaled_sampled_pixel := sampled_pixel * camera.pixel_samples_scale
+
+			// From linear to gamma 2 space
+			scaled_sampled_pixel.r = linalg.sqrt(scaled_sampled_pixel.r)
+			scaled_sampled_pixel.g = linalg.sqrt(scaled_sampled_pixel.g)
+			scaled_sampled_pixel.b = linalg.sqrt(scaled_sampled_pixel.b)
+			pixel_color := scaled_sampled_pixel * 255.999
+
+			fmt.sbprintln(&builder, int(pixel_color.r), int(pixel_color.g), int(pixel_color.b))
 		}
 	}
 	fmt.println()
@@ -175,6 +175,7 @@ get_ray_color :: proc(
 	if max_depth <= 0 do return Color3{0, 0, 0}
 
 	// Detect closest intersection
+	// TODO: multithread this
 	for sphere in spheres {
 		distance := sphere.center - ray.origin
 		a := linalg.length2(ray.direction)
@@ -196,24 +197,21 @@ get_ray_color :: proc(
 			}
 		}
 
-		// Intersection closest so far set to upper limit
 		tmax, intersection.t = root, root
 		intersection.point = ray.origin + intersection.t * ray.direction
 		intersection.normal = (intersection.point - sphere.center) / sphere.radius
-
-		// If normal and ray have opposite directions
 		intersection.kind =
 			.NORMAL_ALIGNED if linalg.dot(intersection.normal, ray.direction) > 0 else .NORMAL_OPPOSITE
-
 	}
 
 	#partial switch intersection.kind {
 	case .NO_HIT:
 		normalized_ray := linalg.vector_normalize(ray.direction)
 		t := (normalized_ray.y + 1) * 0.5
+
 		return linalg.lerp(Color3{1, 1, 1}, Color3{0.5, 0.7, 1}, t)
 	case:
-		// Seems dumb, find a better way later
+		// TODO: Seems dumb, find a better way
 		reflected_ray: Vec3
 		for {
 			reflected_ray = Vec3 {
@@ -228,13 +226,11 @@ get_ray_color :: proc(
 				break
 			}
 		}
-
-		reflected_ray =
-			reflected_ray if linalg.dot(intersection.normal, reflected_ray) > 0 else -reflected_ray
+		direction := intersection.normal + reflected_ray
 
 		return(
 			get_ray_color(
-				Ray{intersection.point, reflected_ray},
+				Ray{origin = intersection.point, direction = direction},
 				max_depth = max_depth - 1,
 				spheres = spheres,
 			) *
