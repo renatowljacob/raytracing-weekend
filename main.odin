@@ -9,6 +9,7 @@ import "core:strings"
 import "core:time"
 
 FILENAME :: "image.ppm"
+F64_NEAR_ZERO :: 1e-8
 
 Color3 :: [3]f64
 Point3 :: [3]f64
@@ -32,27 +33,36 @@ Image :: struct {
 	aspect_ratio: f64,
 }
 
+Material_Kind :: enum i8 {
+	LAMBERTIAN,
+	METALLIC,
+}
+Material :: struct {
+	albedo: Color3,
+	kind:   Material_Kind,
+}
+
 Ray :: struct {
 	origin:    Point3,
 	direction: Vec3,
 }
 
-Ray_Intersection_Kind :: enum i8 {
-	NO_HIT,
-	NORMAL_ALIGNED,
-	NORMAL_OPPOSITE,
-}
-
+// Ray_Intersection_Kind :: enum i8 {
+// 	NO_HIT,
+// 	NORMAL_ALIGNED,
+// 	NORMAL_OPPOSITE,
+// }
 Ray_Intersection :: struct {
-	point:  Point3,
-	normal: Vec3,
-	t:      f64,
-	kind:   Ray_Intersection_Kind,
+	point:    Point3,
+	normal:   Vec3,
+	material: ^Material,
+	has_hit:  bool,
 }
 
-Sphere :: struct {
-	center: Point3,
-	radius: f64,
+Object :: struct {
+	center:   Point3,
+	radius:   f64,
+	material: ^Material,
 }
 
 main :: proc() {
@@ -101,16 +111,35 @@ main :: proc() {
 	}
 	camera.samples_per_pixel = 100
 	camera.pixel_samples_scale = 1 / f64(camera.samples_per_pixel)
-	camera.max_depth = 10
+	camera.max_depth = 50
 
 	focal_length: f64 = 1
 	viewport_upper_left :=
 		camera.center - Vec3{0, 0, focal_length} - viewport_x / 2 - viewport_y / 2
 	camera.pixel.first = viewport_upper_left + 0.5 * (camera.pixel.delta_x + camera.pixel.delta_y)
 
-	spheres := [?]Sphere {
-		{center = Point3{0, 0, -1}, radius = 0.5},
-		{center = Point3{0, -100.5, -1}, radius = 100},
+	ground := Material {
+		kind   = .LAMBERTIAN,
+		albedo = {0.8, 0.8, 0},
+	}
+	center_sphere := Material {
+		kind   = .LAMBERTIAN,
+		albedo = {0.1, 0.2, 0.5},
+	}
+	left_sphere := Material {
+		kind   = .METALLIC,
+		albedo = {0.8, 0.8, 0.8},
+	}
+	right_sphere := Material {
+		kind   = .METALLIC,
+		albedo = {0.8, 0.6, 0.2},
+	}
+
+	world := [?]Object {
+		{center = Point3{0, -100.5, -1}, radius = 100, material = &ground},
+		{center = Point3{0, 0, -1.2}, radius = 0.5, material = &center_sphere},
+		{center = Point3{-1, 0, -1}, radius = 0.5, material = &left_sphere},
+		{center = Point3{1, 0, -1}, radius = 0.5, material = &right_sphere},
 	}
 
 	// Render image
@@ -134,20 +163,15 @@ main :: proc() {
 					ray,
 					tmin = 0.001,
 					max_depth = camera.max_depth,
-					spheres = spheres[:],
+					world = world[:],
 				)
-				sampled_pixel += {clamp(color.r, 0, 1), clamp(color.g, 0, 1), clamp(color.b, 0, 1)}
+				sampled_pixel += linalg.clamp(color, 0, 1)
 			}
 
 			scaled_sampled_pixel := sampled_pixel * camera.pixel_samples_scale
+			pixel_color := linalg.to_int(linalg.sqrt(scaled_sampled_pixel) * 255.999) // Linear to gamma 2 space
 
-			// From linear to gamma 2 space
-			scaled_sampled_pixel.r = linalg.sqrt(scaled_sampled_pixel.r)
-			scaled_sampled_pixel.g = linalg.sqrt(scaled_sampled_pixel.g)
-			scaled_sampled_pixel.b = linalg.sqrt(scaled_sampled_pixel.b)
-			pixel_color := scaled_sampled_pixel * 255.999
-
-			fmt.sbprintln(&builder, int(pixel_color.r), int(pixel_color.g), int(pixel_color.b))
+			fmt.sbprintln(&builder, pixel_color.r, pixel_color.g, pixel_color.b)
 		}
 	}
 	fmt.println()
@@ -162,24 +186,30 @@ main :: proc() {
 	fmt.println("Elapsed time:", time.since(start))
 }
 
+// BUG: For some reason colored objects are darker than they should be.
+// Metallic objects also have a weird noise
 get_ray_color :: proc(
 	ray: Ray,
 	tmin: f64 = 0,
 	tmax := math.INF_F64,
 	max_depth := 10,
-	spheres: []Sphere,
-) -> Color3 {
+	world: []Object,
+) -> (
+	color: Color3,
+) {
+	if max_depth <= 0 {
+		return
+	}
+
 	intersection: Ray_Intersection
 	tmax := tmax
 
-	if max_depth <= 0 do return Color3{0, 0, 0}
-
 	// Detect closest intersection
 	// TODO: multithread this
-	for sphere in spheres {
-		distance := sphere.center - ray.origin
+	for object in world {
+		distance := object.center - ray.origin
 		a := linalg.length2(ray.direction)
-		c := linalg.length2(distance) - sphere.radius * sphere.radius
+		c := linalg.length2(distance) - object.radius * object.radius
 		h := linalg.dot(ray.direction, distance)
 		discriminant := h * h - a * c
 
@@ -197,46 +227,60 @@ get_ray_color :: proc(
 			}
 		}
 
-		tmax, intersection.t = root, root
-		intersection.point = ray.origin + intersection.t * ray.direction
-		intersection.normal = (intersection.point - sphere.center) / sphere.radius
-		intersection.kind =
-			.NORMAL_ALIGNED if linalg.dot(intersection.normal, ray.direction) > 0 else .NORMAL_OPPOSITE
+		tmax = root
+		intersection.material = object.material
+		intersection.point = ray.origin + root * ray.direction
+		intersection.normal = linalg.normalize(
+			(intersection.point - object.center) / object.radius,
+		)
+		intersection.has_hit = true
 	}
 
-	#partial switch intersection.kind {
-	case .NO_HIT:
-		normalized_ray := linalg.vector_normalize(ray.direction)
-		t := (normalized_ray.y + 1) * 0.5
+	if !intersection.has_hit {
+		direction := linalg.vector_normalize(ray.direction)
+		color = linalg.lerp(Color3{1, 1, 1}, Color3{0.5, 0.7, 1}, (direction.y + 1) * 0.5)
+		return
+	}
 
-		return linalg.lerp(Color3{1, 1, 1}, Color3{0.5, 0.7, 1}, t)
-	case:
+	diffused_ray := Ray {
+		origin = intersection.point,
+	}
+	switch intersection.material.kind {
+	case .LAMBERTIAN:
 		// TODO: Seems dumb, find a better way
-		reflected_ray: Vec3
+		direction: Vec3
 		for {
-			reflected_ray = Vec3 {
+			direction = Vec3 {
 				rand.float64_range(-1, 1),
 				rand.float64_range(-1, 1),
 				rand.float64_range(-1, 1),
 			}
-			reflected_ray_len2 := linalg.length2(reflected_ray)
+			direction_len2 := linalg.length2(direction)
 
-			if reflected_ray_len2 >= math.F64_MIN && reflected_ray_len2 <= 1 {
-				reflected_ray /= linalg.sqrt(reflected_ray_len2)
+			// NOTE: or 10e-160
+			if direction_len2 >= math.F64_MIN && direction_len2 <= 1 {
+				direction /= math.sqrt(direction_len2)
 				break
 			}
 		}
-		direction := intersection.normal + reflected_ray
+		direction += intersection.normal
 
-		return(
-			get_ray_color(
-				Ray{origin = intersection.point, direction = direction},
-				max_depth = max_depth - 1,
-				spheres = spheres,
-			) *
-			0.5 \
-		)
+		if linalg.all(linalg.less_than_array(linalg.abs(direction), F64_NEAR_ZERO)) {
+			direction = intersection.normal
+		}
+
+		diffused_ray.direction = direction
+	case .METALLIC:
+		// Reflect
+		direction :=
+			ray.direction -
+			2 * (linalg.dot(ray.direction, intersection.normal)) * intersection.normal
+		diffused_ray.direction = direction
 	}
-	// case .NORMAL_ALIGNED:
-	// case .NORMAL_OPPOSITE:
+
+	return(
+		intersection.material.albedo *
+		get_ray_color(diffused_ray, max_depth = max_depth - 1, world = world) *
+		0.5 \
+	)
 }
