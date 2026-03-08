@@ -52,7 +52,7 @@ Ray :: struct {
 // 	NORMAL_ALIGNED,
 // 	NORMAL_OPPOSITE,
 // }
-Ray_Intersection :: struct {
+Ray_Intersection_Data :: struct {
 	point:    Point3,
 	normal:   Vec3,
 	material: ^Material,
@@ -144,7 +144,7 @@ main :: proc() {
 
 	// Render image
 	for y in 0 ..< image.height {
-		fmt.printf("\rLines remaining: %v ", image.height - y, flush = false)
+		fmt.printf("\rProgress: [% 3d/% 3d] ", y + 1, image.height, flush = false)
 
 		for x in 0 ..< image.width {
 			sampled_pixel: Color3
@@ -159,18 +159,18 @@ main :: proc() {
 				ray.origin = camera.center
 				ray.direction = pixel_sample - ray.origin
 
-				color := get_ray_color(
-					ray,
-					tmin = 0.001,
-					max_depth = camera.max_depth,
-					world = world[:],
-				)
-				sampled_pixel += linalg.clamp(color, 0, 1)
+				color := get_ray_color(ray, max_depth = camera.max_depth, world = world[:])
+				sampled_pixel += color
 			}
 
 			scaled_sampled_pixel := sampled_pixel * camera.pixel_samples_scale
-			pixel_color := linalg.to_int(linalg.sqrt(scaled_sampled_pixel) * 255.999) // Linear to gamma 2 space
-
+			gamma_corrected_pixel: Color3
+			for pixel, index in scaled_sampled_pixel {
+				if pixel > 0 {
+					gamma_corrected_pixel[index] = math.sqrt(pixel)
+				}
+			}
+			pixel_color := linalg.to_int(linalg.clamp(gamma_corrected_pixel, 0, 0.999) * 256)
 			fmt.sbprintln(&builder, pixel_color.r, pixel_color.g, pixel_color.b)
 		}
 	}
@@ -186,11 +186,10 @@ main :: proc() {
 	fmt.println("Elapsed time:", time.since(start))
 }
 
-// BUG: For some reason colored objects are darker than they should be.
-// Metallic objects also have a weird noise
+// TODO: multithread this
 get_ray_color :: proc(
 	ray: Ray,
-	tmin: f64 = 0,
+	tmin: f64 = 0.001,
 	tmax := math.INF_F64,
 	max_depth := 10,
 	world: []Object,
@@ -201,11 +200,10 @@ get_ray_color :: proc(
 		return
 	}
 
-	intersection: Ray_Intersection
+	intersection_data: Ray_Intersection_Data
 	tmax := tmax
 
-	// Detect closest intersection
-	// TODO: multithread this
+	// Detect intersections
 	for object in world {
 		distance := object.center - ray.origin
 		a := linalg.length2(ray.direction)
@@ -218,69 +216,68 @@ get_ray_color :: proc(
 			continue
 		}
 
-		discriminant_sqrt := linalg.sqrt(discriminant)
+		discriminant_sqrt := math.sqrt(discriminant)
 		root := (h - discriminant_sqrt) / a
-		if root <= tmin || root >= tmax {
+		if !(tmin < root && root < tmax) {
 			root = (h + discriminant_sqrt) / a
-			if root <= tmin || root >= tmax {
+			if !(tmin < root && root < tmax) {
 				continue
 			}
 		}
 
+		// Closest intersection so far
 		tmax = root
-		intersection.material = object.material
-		intersection.point = ray.origin + root * ray.direction
-		intersection.normal = linalg.normalize(
-			(intersection.point - object.center) / object.radius,
-		)
-		intersection.has_hit = true
+		intersection_data.material = object.material
+		intersection_data.point = ray.origin + root * ray.direction
+		intersection_data.normal = (intersection_data.point - object.center) / object.radius
+		intersection_data.has_hit = true
 	}
 
-	if !intersection.has_hit {
+	if linalg.dot(intersection_data.normal, ray.direction) > 0 {
+		intersection_data.normal = -intersection_data.normal
+	}
+
+	if !intersection_data.has_hit {
 		direction := linalg.vector_normalize(ray.direction)
 		color = linalg.lerp(Color3{1, 1, 1}, Color3{0.5, 0.7, 1}, (direction.y + 1) * 0.5)
 		return
 	}
 
+	// Scatter/reflect
 	diffused_ray := Ray {
-		origin = intersection.point,
+		origin = intersection_data.point,
 	}
-	switch intersection.material.kind {
+	switch intersection_data.material.kind {
 	case .LAMBERTIAN:
 		// TODO: Seems dumb, find a better way
 		direction: Vec3
 		for {
-			direction = Vec3 {
-				rand.float64_range(-1, 1),
-				rand.float64_range(-1, 1),
-				rand.float64_range(-1, 1),
-			}
+			for &v in direction do v = rand.float64_range(-1, 1)
 			direction_len2 := linalg.length2(direction)
 
-			// NOTE: or 10e-160
-			if direction_len2 >= math.F64_MIN && direction_len2 <= 1 {
+			// NOTE: or math.F64_MIN
+			if 1e-160 < direction_len2 && direction_len2 <= 1 {
 				direction /= math.sqrt(direction_len2)
 				break
 			}
 		}
-		direction += intersection.normal
+		direction += intersection_data.normal
 
 		if linalg.all(linalg.less_than_array(linalg.abs(direction), F64_NEAR_ZERO)) {
-			direction = intersection.normal
+			direction = intersection_data.normal
 		}
 
 		diffused_ray.direction = direction
 	case .METALLIC:
-		// Reflect
 		direction :=
 			ray.direction -
-			2 * (linalg.dot(ray.direction, intersection.normal)) * intersection.normal
+			2 * linalg.dot(ray.direction, intersection_data.normal) * intersection_data.normal
 		diffused_ray.direction = direction
 	}
 
 	return(
-		intersection.material.albedo *
-		get_ray_color(diffused_ray, max_depth = max_depth - 1, world = world) *
-		0.5 \
+		intersection_data.material.albedo *
+		get_ray_color(diffused_ray, max_depth = max_depth - 1, world = world) \
 	)
+
 }
