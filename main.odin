@@ -36,11 +36,13 @@ Image :: struct {
 Material_Kind :: enum {
 	LAMBERTIAN,
 	METALLIC,
+	DIELETRIC,
 }
 Material :: struct {
-	albedo: Color3,
-	fuzz:   f64,
-	kind:   Material_Kind,
+	albedo:           Color3,
+	fuzz:             f64,
+	refraction_index: f64,
+	kind:             Material_Kind,
 }
 
 Ray :: struct {
@@ -49,10 +51,11 @@ Ray :: struct {
 }
 
 Ray_Intersection_Data :: struct {
-	point:    Point3,
-	normal:   Vec3,
-	material: ^Material,
-	has_hit:  bool,
+	point:          Point3,
+	normal:         Vec3,
+	material:       ^Material,
+	is_ray_outward: bool,
+	has_hit:        bool,
 }
 
 Object :: struct {
@@ -78,7 +81,10 @@ main :: proc() {
 	image.height = int(f64(image.width) / image.aspect_ratio)
 
 	max_line_len := 12
-	buf, alloc_err := make([]u8, max_line_len * image.width * image.height + 128)
+	buf, alloc_err := make(
+		[]u8,
+		max_line_len * image.width * image.height + 128,
+	)
 	if alloc_err != nil {
 		fmt.eprintln("Error allocating buffer:", alloc_err)
 		return
@@ -111,8 +117,13 @@ main :: proc() {
 
 	focal_length: f64 = 1
 	viewport_upper_left :=
-		camera.center - Vec3{0, 0, focal_length} - viewport_x / 2 - viewport_y / 2
-	camera.pixel.first = viewport_upper_left + 0.5 * (camera.pixel.delta_x + camera.pixel.delta_y)
+		camera.center -
+		Vec3{0, 0, focal_length} -
+		viewport_x / 2 -
+		viewport_y / 2
+	camera.pixel.first =
+		viewport_upper_left +
+		0.5 * (camera.pixel.delta_x + camera.pixel.delta_y)
 
 	ground := Material {
 		kind   = .LAMBERTIAN,
@@ -123,9 +134,12 @@ main :: proc() {
 		albedo = {0.1, 0.2, 0.5},
 	}
 	left_sphere := Material {
-		kind   = .METALLIC,
-		albedo = {0.8, 0.8, 0.8},
-		fuzz   = 0.3,
+		kind             = .DIELETRIC,
+		refraction_index = 1.5,
+	}
+	bubble := Material {
+		kind             = .DIELETRIC,
+		refraction_index = 1 / left_sphere.refraction_index,
 	}
 	right_sphere := Material {
 		kind   = .METALLIC,
@@ -137,12 +151,18 @@ main :: proc() {
 		{center = Point3{0, -100.5, -1}, radius = 100, material = &ground},
 		{center = Point3{0, 0, -1.2}, radius = 0.5, material = &center_sphere},
 		{center = Point3{-1, 0, -1}, radius = 0.5, material = &left_sphere},
+		{center = Point3{-1, 0, -1}, radius = 0.4, material = &bubble},
 		{center = Point3{1, 0, -1}, radius = 0.5, material = &right_sphere},
 	}
 
 	// Render image
 	for y in 0 ..< image.height {
-		fmt.printf("\rProgress: [% 3d/% 3d] ", y + 1, image.height, flush = false)
+		fmt.printf(
+			"\rProgress: [% 3d/% 3d] ",
+			y + 1,
+			image.height,
+			flush = false,
+		)
 
 		for x in 0 ..< image.width {
 			sampled_pixel: Color3
@@ -157,7 +177,11 @@ main :: proc() {
 				ray.origin = camera.center
 				ray.direction = pixel_sample - ray.origin
 
-				color := get_ray_color(ray, max_depth = camera.max_depth, world = world[:])
+				color := get_ray_color(
+					ray,
+					max_depth = camera.max_depth,
+					world = world[:],
+				)
 				sampled_pixel += color
 			}
 
@@ -168,8 +192,15 @@ main :: proc() {
 					gamma_corrected_pixel[index] = math.sqrt(pixel)
 				}
 			}
-			pixel_color := linalg.to_int(linalg.clamp(gamma_corrected_pixel, 0, 0.999) * 256)
-			fmt.sbprintln(&builder, pixel_color.r, pixel_color.g, pixel_color.b)
+			pixel_color := linalg.to_int(
+				linalg.clamp(gamma_corrected_pixel, 0, 0.999) * 256,
+			)
+			fmt.sbprintln(
+				&builder,
+				pixel_color.r,
+				pixel_color.g,
+				pixel_color.b,
+			)
 		}
 	}
 	fmt.println()
@@ -227,17 +258,24 @@ get_ray_color :: proc(
 		tmax = root
 		intersection_data.material = object.material
 		intersection_data.point = ray.origin + root * ray.direction
-		intersection_data.normal = (intersection_data.point - object.center) / object.radius
+		intersection_data.normal =
+			(intersection_data.point - object.center) / object.radius
 		intersection_data.has_hit = true
 	}
 
-	if linalg.dot(ray.direction, intersection_data.normal) > 0 {
+	if linalg.dot(ray.direction, intersection_data.normal) <= 0 {
+		intersection_data.is_ray_outward = true
+	} else {
 		intersection_data.normal = -intersection_data.normal
 	}
 
 	if !intersection_data.has_hit {
 		direction := linalg.vector_normalize(ray.direction)
-		out = linalg.lerp(Color3{1, 1, 1}, Color3{0.5, 0.7, 1}, (direction.y + 1) * 0.5)
+		out = linalg.lerp(
+			Color3{1, 1, 1},
+			Color3{0.5, 0.7, 1},
+			(direction.y + 1) * 0.5,
+		)
 		return
 	}
 
@@ -248,22 +286,61 @@ get_ray_color :: proc(
 	switch intersection_data.material.kind {
 	case .LAMBERTIAN:
 		direction := random_unit_vector() + intersection_data.normal
-		if linalg.all(linalg.less_than_array(linalg.abs(direction), F64_NEAR_ZERO)) {
+		if linalg.all(
+			linalg.less_than_array(linalg.abs(direction), F64_NEAR_ZERO),
+		) {
 			direction = intersection_data.normal
 		}
 
 		diffused_ray.direction = direction
 	case .METALLIC:
-		direction :=
-			ray.direction -
-			2 * linalg.dot(ray.direction, intersection_data.normal) * intersection_data.normal
+		direction := reflect(ray.direction, intersection_data.normal)
 		direction =
-			linalg.normalize(direction) + (intersection_data.material.fuzz * random_unit_vector())
-		diffused_ray.direction = direction
+			linalg.normalize(direction) +
+			(intersection_data.material.fuzz * random_unit_vector())
 
 		if (linalg.dot(direction, intersection_data.normal) <= 0) {
 			return
 		}
+
+		diffused_ray.direction = direction
+	case .DIELETRIC:
+		intersection_data.material.albedo = Color3{1, 1, 1}
+
+		refraction_index: f64
+		if intersection_data.is_ray_outward {
+			refraction_index =
+				(1 / intersection_data.material.refraction_index)
+		} else {
+			refraction_index = intersection_data.material.refraction_index
+		}
+
+		unit_direction := linalg.normalize(ray.direction)
+
+		cos := min(linalg.dot(-unit_direction, intersection_data.normal), 1)
+		sin := math.sqrt(1 - cos * cos)
+
+		cannot_refract := refraction_index * sin > 1
+
+		direction: Vec3
+		if (cannot_refract ||
+			   reflectance(cos, refraction_index) > rand.float64()) {
+			direction = reflect(unit_direction, intersection_data.normal)
+		} else {
+			cos := min(
+				linalg.dot(-unit_direction, intersection_data.normal),
+				1,
+			)
+			perpendicular_ray :=
+				refraction_index *
+				(unit_direction + cos * intersection_data.normal)
+			parallel_ray :=
+				-math.sqrt(abs(1 - linalg.length2(perpendicular_ray))) *
+				intersection_data.normal
+
+			direction = perpendicular_ray + parallel_ray
+		}
+		diffused_ray.direction = direction
 	}
 
 	return(
@@ -284,4 +361,15 @@ random_unit_vector :: proc() -> (out: Vec3) {
 			return
 		}
 	}
+}
+
+reflect :: proc(direction, normal: Vec3) -> Vec3 {
+	return direction - 2 * linalg.dot(direction, normal) * normal
+}
+
+// Schlick's approximation for reflectance
+reflectance :: proc(cos, refraction_index: f64) -> f64 {
+	r := (1 - refraction_index) / (1 + refraction_index)
+	r *= r
+	return r + (1 - r) * math.pow(1 - cos, 5)
 }
