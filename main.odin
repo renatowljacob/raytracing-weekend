@@ -33,12 +33,13 @@ Image :: struct {
 	aspect_ratio: f64,
 }
 
-Material_Kind :: enum i8 {
+Material_Kind :: enum {
 	LAMBERTIAN,
 	METALLIC,
 }
 Material :: struct {
 	albedo: Color3,
+	fuzz:   f64,
 	kind:   Material_Kind,
 }
 
@@ -47,11 +48,6 @@ Ray :: struct {
 	direction: Vec3,
 }
 
-// Ray_Intersection_Kind :: enum i8 {
-// 	NO_HIT,
-// 	NORMAL_ALIGNED,
-// 	NORMAL_OPPOSITE,
-// }
 Ray_Intersection_Data :: struct {
 	point:    Point3,
 	normal:   Vec3,
@@ -129,10 +125,12 @@ main :: proc() {
 	left_sphere := Material {
 		kind   = .METALLIC,
 		albedo = {0.8, 0.8, 0.8},
+		fuzz   = 0.3,
 	}
 	right_sphere := Material {
 		kind   = .METALLIC,
 		albedo = {0.8, 0.6, 0.2},
+		fuzz   = 1,
 	}
 
 	world := [?]Object {
@@ -194,7 +192,7 @@ get_ray_color :: proc(
 	max_depth := 10,
 	world: []Object,
 ) -> (
-	color: Color3,
+	out: Color3,
 ) {
 	if max_depth <= 0 {
 		return
@@ -233,13 +231,13 @@ get_ray_color :: proc(
 		intersection_data.has_hit = true
 	}
 
-	if linalg.dot(intersection_data.normal, ray.direction) > 0 {
+	if linalg.dot(ray.direction, intersection_data.normal) > 0 {
 		intersection_data.normal = -intersection_data.normal
 	}
 
 	if !intersection_data.has_hit {
 		direction := linalg.vector_normalize(ray.direction)
-		color = linalg.lerp(Color3{1, 1, 1}, Color3{0.5, 0.7, 1}, (direction.y + 1) * 0.5)
+		out = linalg.lerp(Color3{1, 1, 1}, Color3{0.5, 0.7, 1}, (direction.y + 1) * 0.5)
 		return
 	}
 
@@ -249,20 +247,7 @@ get_ray_color :: proc(
 	}
 	switch intersection_data.material.kind {
 	case .LAMBERTIAN:
-		// TODO: Seems dumb, find a better way
-		direction: Vec3
-		for {
-			for &v in direction do v = rand.float64_range(-1, 1)
-			direction_len2 := linalg.length2(direction)
-
-			// NOTE: or math.F64_MIN
-			if 1e-160 < direction_len2 && direction_len2 <= 1 {
-				direction /= math.sqrt(direction_len2)
-				break
-			}
-		}
-		direction += intersection_data.normal
-
+		direction := random_unit_vector() + intersection_data.normal
 		if linalg.all(linalg.less_than_array(linalg.abs(direction), F64_NEAR_ZERO)) {
 			direction = intersection_data.normal
 		}
@@ -272,12 +257,31 @@ get_ray_color :: proc(
 		direction :=
 			ray.direction -
 			2 * linalg.dot(ray.direction, intersection_data.normal) * intersection_data.normal
+		direction =
+			linalg.normalize(direction) + (intersection_data.material.fuzz * random_unit_vector())
 		diffused_ray.direction = direction
+
+		if (linalg.dot(direction, intersection_data.normal) <= 0) {
+			return
+		}
 	}
 
 	return(
 		intersection_data.material.albedo *
 		get_ray_color(diffused_ray, max_depth = max_depth - 1, world = world) \
 	)
+}
 
+// TODO: Seems dumb, find a better way
+random_unit_vector :: proc() -> (out: Vec3) {
+	for {
+		for &v in out do v = rand.float64_range(-1, 1)
+		out_len2 := linalg.length2(out)
+
+		// NOTE: or math.F64_MIN
+		if 1e-160 < out_len2 && out_len2 <= 1 {
+			out /= math.sqrt(out_len2)
+			return
+		}
+	}
 }
