@@ -15,22 +15,38 @@ Color3 :: [3]f64
 Point3 :: [3]f64
 Vec3 :: [3]f64
 
-Camera :: struct {
-	pixel:               struct {
-		first:   Point3,
-		delta_x: Vec3,
-		delta_y: Vec3,
-	},
-	center:              Point3,
-	pixel_samples_scale: f64,
-	samples_per_pixel:   int,
-	max_depth:           int,
-}
-
 Image :: struct {
 	width:        int,
 	height:       int,
 	aspect_ratio: f64,
+}
+
+Config :: struct {
+	pixel_samples_scale: f64,
+	samples_per_pixel:   int,
+	defocus_angle:       f64,
+	focus_distance:      f64,
+	max_depth:           int,
+}
+
+Camera :: struct {
+	center:   Point3,
+	lookfrom: Point3,
+	lookat:   Point3,
+	vup:      Vec3, // also used for rotation
+	vfov:     f64, // vertical field of view
+}
+
+Viewport :: struct {
+	u:           Vec3, // x-axis viewport vector
+	v:           Vec3, // y-axis viewport vector
+	delta:       struct {
+		u: Vec3, // x-axis pixel delta vector
+		v: Vec3, // y-axis pixel delta vector
+	},
+	first_pixel: Point3,
+	width:       f64,
+	height:      f64,
 }
 
 Material_Kind :: enum {
@@ -65,6 +81,7 @@ Object :: struct {
 }
 
 main :: proc() {
+	// Benchmark at the end
 	start := time.now()
 
 	// Setup
@@ -98,33 +115,45 @@ main :: proc() {
 	fmt.sbprintln(&builder, image.height)
 	fmt.sbprintln(&builder, "255")
 
-	// Test this with aspect_ratio later
-	viewport_height: f64 = 2
-	viewport_width := viewport_height * (f64(image.width) / f64(image.height))
-	viewport_x: Vec3
-	viewport_x.x = viewport_width
-	viewport_y: Vec3
-	viewport_y.y = -viewport_height
+	// Various control parameters
+	config: Config
+	config_init(&config, defocus_angle = math.PI / 18, focus_distance = 3.4)
 
+	// Camera from which rays originate
 	camera: Camera
-	camera.pixel = {
-		delta_x = viewport_x / f64(image.width),
-		delta_y = viewport_y / f64(image.height),
-	}
-	camera.samples_per_pixel = 100
-	camera.pixel_samples_scale = 1 / f64(camera.samples_per_pixel)
-	camera.max_depth = 50
+	camera_init(&camera, lookfrom = {-2, 2, 1}, vfov = math.PI / 9)
 
-	focal_length: f64 = 1
+	// Calculate basis vectors to set viewport coordinates
+	basis_w := linalg.normalize(camera.lookfrom - camera.lookat)
+	basis_u := linalg.normalize(linalg.cross(camera.vup, basis_w))
+	basis_v := linalg.cross(basis_w, basis_u)
+
+	// Viewport into which to map image pixels
+	viewport: Viewport
+	viewport.height = 2 * math.tan(camera.vfov / 2) * config.focus_distance
+	viewport.width = viewport.height * (f64(image.width) / f64(image.height))
+	viewport.u = viewport.width * basis_u
+	viewport.v = viewport.height * -(basis_v)
+	viewport.delta = {
+		u = viewport.u / f64(image.width),
+		v = viewport.v / f64(image.height),
+	}
+
+	// Get first pixel of viewport
 	viewport_upper_left :=
 		camera.center -
-		Vec3{0, 0, focal_length} -
-		viewport_x / 2 -
-		viewport_y / 2
-	camera.pixel.first =
-		viewport_upper_left +
-		0.5 * (camera.pixel.delta_x + camera.pixel.delta_y)
+		config.focus_distance * basis_w -
+		viewport.u / 2 -
+		viewport.v / 2
+	viewport.first_pixel =
+		viewport_upper_left + 0.5 * (viewport.delta.u + viewport.delta.v)
 
+	defocus_radius :=
+		config.focus_distance * math.tan(config.defocus_angle / 2)
+	defocus_disk_u := basis_u * defocus_radius
+	defocus_disk_v := basis_v * defocus_radius
+
+	// Materials
 	ground := Material {
 		kind   = .LAMBERTIAN,
 		albedo = {0.8, 0.8, 0},
@@ -147,6 +176,7 @@ main :: proc() {
 		fuzz   = 1,
 	}
 
+	// Objects to be raytraced
 	world := [?]Object {
 		{center = Point3{0, -100.5, -1}, radius = 100, material = &ground},
 		{center = Point3{0, 0, -1.2}, radius = 0.5, material = &center_sphere},
@@ -167,25 +197,45 @@ main :: proc() {
 		for x in 0 ..< image.width {
 			sampled_pixel: Color3
 
-			for _ in 0 ..< camera.samples_per_pixel {
+			for _ in 0 ..< config.samples_per_pixel {
 				offset := Vec3{rand.float64() - 0.5, rand.float64() - 0.5, 0}
 				pixel_sample :=
-					camera.pixel.first +
-					((f64(x) + offset.x) * camera.pixel.delta_x) +
-					((f64(y) + offset.y) * camera.pixel.delta_y)
+					viewport.first_pixel +
+					((f64(x) + offset.x) * viewport.delta.u) +
+					((f64(y) + offset.y) * viewport.delta.v)
+
+				// Initialize ray from camera center or random point in defocus disk
 				ray: Ray
-				ray.origin = camera.center
+				if config.defocus_angle <= 0 {
+					ray.origin = camera.center
+				} else {
+					point: Point3
+					for {
+						point = {
+							rand.float64_range(-1, 1),
+							rand.float64_range(-1, 1),
+							0,
+						}
+						if linalg.length2(point) < 1 {
+							break
+						}
+					}
+					ray.origin =
+						camera.center +
+						(point.x * defocus_disk_u) +
+						(point.y * defocus_disk_v)
+				}
 				ray.direction = pixel_sample - ray.origin
 
 				color := get_ray_color(
 					ray,
-					max_depth = camera.max_depth,
+					max_depth = config.max_depth,
 					world = world[:],
 				)
 				sampled_pixel += color
 			}
 
-			scaled_sampled_pixel := sampled_pixel * camera.pixel_samples_scale
+			scaled_sampled_pixel := sampled_pixel * config.pixel_samples_scale
 			gamma_corrected_pixel: Color3
 			for pixel, index in scaled_sampled_pixel {
 				if pixel > 0 {
@@ -215,10 +265,42 @@ main :: proc() {
 	fmt.println("Elapsed time:", time.since(start))
 }
 
+config_init :: proc(
+	config: ^Config,
+	samples_per_pixel := 100,
+	defocus_angle: f64 = 0,
+	focus_distance: f64 = 10,
+	max_depth := 50,
+) {
+	config^ = {
+		samples_per_pixel = samples_per_pixel,
+		defocus_angle     = defocus_angle,
+		focus_distance    = focus_distance,
+		max_depth         = max_depth,
+	}
+	config.pixel_samples_scale = 1 / f64(config.samples_per_pixel)
+}
+
+camera_init :: proc(
+	camera: ^Camera,
+	lookfrom := Point3{0, 0, 0},
+	lookat := Point3{0, 0, -1},
+	vup := Vec3{0, 1, 0},
+	vfov := math.PI / 2,
+) {
+	camera^ = {
+		lookfrom = lookfrom,
+		lookat   = lookat,
+		vup      = vup,
+		vfov     = vfov,
+	}
+	camera.center = camera.lookfrom
+}
+
 // TODO: multithread this
 get_ray_color :: proc(
 	ray: Ray,
-	tmin: f64 = 0.001,
+	tmin: f64 = 0.001, // NOTE: avoid shadow acne
 	tmax := math.INF_F64,
 	max_depth := 10,
 	world: []Object,
@@ -279,7 +361,7 @@ get_ray_color :: proc(
 		return
 	}
 
-	// Scatter/reflect
+	// Scatter ray
 	diffused_ray := Ray {
 		origin = intersection_data.point,
 	}
@@ -317,23 +399,27 @@ get_ray_color :: proc(
 
 		unit_direction := linalg.normalize(ray.direction)
 
-		cos := min(linalg.dot(-unit_direction, intersection_data.normal), 1)
-		sin := math.sqrt(1 - cos * cos)
+		cos_theta := min(
+			linalg.dot(-unit_direction, intersection_data.normal),
+			1,
+		)
+		sin_theta := math.sqrt(1 - cos_theta * cos_theta)
 
-		cannot_refract := refraction_index * sin > 1
+		cannot_refract := refraction_index * sin_theta > 1
 
 		direction: Vec3
+		// Reflect ray or else refract
 		if (cannot_refract ||
-			   reflectance(cos, refraction_index) > rand.float64()) {
+			   reflectance(cos_theta, refraction_index) > rand.float64()) {
 			direction = reflect(unit_direction, intersection_data.normal)
 		} else {
-			cos := min(
+			cos_theta := min(
 				linalg.dot(-unit_direction, intersection_data.normal),
 				1,
 			)
 			perpendicular_ray :=
 				refraction_index *
-				(unit_direction + cos * intersection_data.normal)
+				(unit_direction + cos_theta * intersection_data.normal)
 			parallel_ray :=
 				-math.sqrt(abs(1 - linalg.length2(perpendicular_ray))) *
 				intersection_data.normal
@@ -368,8 +454,8 @@ reflect :: proc(direction, normal: Vec3) -> Vec3 {
 }
 
 // Schlick's approximation for reflectance
-reflectance :: proc(cos, refraction_index: f64) -> f64 {
+reflectance :: proc(cos_theta, refraction_index: f64) -> f64 {
 	r := (1 - refraction_index) / (1 + refraction_index)
 	r *= r
-	return r + (1 - r) * math.pow(1 - cos, 5)
+	return r + (1 - r) * math.pow(1 - cos_theta, 5)
 }
