@@ -3,7 +3,7 @@
 level=""
 
 case $1 in
-debug) level="-debug -o:none" ;;
+debug) level="-debug -o:none --define:RANDOM_SEED=42" ;;
 release) level="-o:speed" ;;
 esac
 

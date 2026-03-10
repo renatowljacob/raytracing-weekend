@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
@@ -15,20 +16,24 @@ Color3 :: [3]f64
 Point3 :: [3]f64
 Vec3 :: [3]f64
 
+// PPM image
 Image :: struct {
+	buf:          []u8, // Buffer into which to allocate image
 	width:        int,
 	height:       int,
 	aspect_ratio: f64,
 }
 
+// Miscellaneous configuration values
 Config :: struct {
-	pixel_samples_scale: f64,
-	samples_per_pixel:   int,
-	defocus_angle:       f64,
-	focus_distance:      f64,
-	max_depth:           int,
+	pixel_samples_scale: f64, // Color scale factor for a sum of pixel samples
+	samples_per_pixel:   int, // Count of random samples for each pixel
+	defocus_angle:       f64, // Variation angle of rays through each pixel
+	focus_distance:      f64, // Distance from Camera.lookfrom point to plane of perfect focus
+	max_depth:           int, // Maximum number of ray bounces into scene
 }
 
+// Camera from which rays originate
 Camera :: struct {
 	center:   Point3,
 	lookfrom: Point3,
@@ -37,6 +42,7 @@ Camera :: struct {
 	vfov:     f64, // vertical field of view
 }
 
+// Viewport into which to map image pixels
 Viewport :: struct {
 	u:           Vec3, // x-axis viewport vector
 	v:           Vec3, // y-axis viewport vector
@@ -44,7 +50,7 @@ Viewport :: struct {
 		u: Vec3, // x-axis pixel delta vector
 		v: Vec3, // y-axis pixel delta vector
 	},
-	first_pixel: Point3,
+	first_pixel: Point3, // 0th pixel
 	width:       f64,
 	height:      f64,
 }
@@ -81,8 +87,12 @@ Object :: struct {
 }
 
 main :: proc() {
-	// Benchmark at the end
-	start := time.now()
+	// Set random seed on debug or when explicitly passed
+	RANDOM_SEED: u64 : #config(RANDOM_SEED, 0)
+	when ODIN_DEBUG || RANDOM_SEED > 0 {
+		state := rand.create(RANDOM_SEED)
+		context.random_generator = rand.default_random_generator(&state)
+	}
 
 	// Setup
 	file, io_err := os.create(FILENAME)
@@ -92,43 +102,64 @@ main :: proc() {
 	}
 	defer os.close(file)
 
+	// Initialize image
 	image: Image
-	image.aspect_ratio = 16.0 / 9.0
-	image.width = 400
-	image.height = int(f64(image.width) / image.aspect_ratio)
+	{
+		image = {
+			aspect_ratio = 16.0 / 9.0,
+			width        = 400,
+		}
+		image.height = int(f64(image.width) / image.aspect_ratio)
 
-	max_line_len := 12
-	buf, alloc_err := make(
-		[]u8,
-		max_line_len * image.width * image.height + 128,
-	)
-	if alloc_err != nil {
-		fmt.eprintln("Error allocating buffer:", alloc_err)
-		return
+		line_len := 12
+		alloc_err: mem.Allocator_Error
+		image.buf, alloc_err = make(
+			[]u8,
+			line_len * image.height * image.width + 128,
+		)
+		if alloc_err != nil {
+			fmt.eprintln("Error allocating buffer for image:", alloc_err)
+			return
+		}
 	}
-	defer delete(buf)
+	defer delete(image.buf)
 
-	builder := strings.builder_from_bytes(buf[:])
-
-	fmt.sbprintln(&builder, "P3")
+	builder := strings.builder_from_bytes(image.buf[:])
+	fmt.sbprintln(&builder, "P3") // ASCII
 	fmt.sbprintln(&builder, image.width)
 	fmt.sbprintln(&builder, image.height)
-	fmt.sbprintln(&builder, "255")
+	fmt.sbprintln(&builder, "255") // max color
 
-	// Various control parameters
+	// Initialize config
 	config: Config
-	config_init(&config, defocus_angle = math.PI / 18, focus_distance = 3.4)
+	{
+		config = {
+			samples_per_pixel = 100,
+			defocus_angle     = 0,
+			focus_distance    = 10,
+			max_depth         = 50,
+		}
+		config.pixel_samples_scale = 1 / f64(config.samples_per_pixel)
+	}
 
-	// Camera from which rays originate
+	// Initialize camera with right-handed coordinates
 	camera: Camera
-	camera_init(&camera, lookfrom = {-2, 2, 1}, vfov = math.PI / 9)
+	{
+		camera = {
+			lookfrom = {0, 0, 0},
+			lookat   = {0, 0, -1},
+			vup      = {0, 1, 0},
+			vfov     = math.PI / 2,
+		}
+		camera.center = camera.lookfrom
+	}
 
 	// Calculate basis vectors to set viewport coordinates
 	basis_w := linalg.normalize(camera.lookfrom - camera.lookat)
 	basis_u := linalg.normalize(linalg.cross(camera.vup, basis_w))
 	basis_v := linalg.cross(basis_w, basis_u)
 
-	// Viewport into which to map image pixels
+	// Initialize viewport and convert to computer coordinates
 	viewport: Viewport
 	viewport.height = 2 * math.tan(camera.vfov / 2) * config.focus_distance
 	viewport.width = viewport.height * (f64(image.width) / f64(image.height))
@@ -185,7 +216,11 @@ main :: proc() {
 		{center = Point3{1, 0, -1}, radius = 0.5, material = &right_sphere},
 	}
 
+	// Benchmark at the end
+	start := time.now()
+
 	// Render image
+	// TODO: multithread this
 	for y in 0 ..< image.height {
 		fmt.printf(
 			"\rProgress: [% 3d/% 3d] ",
@@ -256,7 +291,7 @@ main :: proc() {
 	fmt.println()
 
 	builder_len := strings.builder_len(builder)
-	if _, err := os.write(file, buf[:builder_len]); err != nil {
+	if _, err := os.write(file, image.buf[:builder_len]); err != nil {
 		fmt.eprintfln("Error writing to %v: %v", FILENAME, err)
 		return
 	}
@@ -265,39 +300,6 @@ main :: proc() {
 	fmt.println("Elapsed time:", time.since(start))
 }
 
-config_init :: proc(
-	config: ^Config,
-	samples_per_pixel := 100,
-	defocus_angle: f64 = 0,
-	focus_distance: f64 = 10,
-	max_depth := 50,
-) {
-	config^ = {
-		samples_per_pixel = samples_per_pixel,
-		defocus_angle     = defocus_angle,
-		focus_distance    = focus_distance,
-		max_depth         = max_depth,
-	}
-	config.pixel_samples_scale = 1 / f64(config.samples_per_pixel)
-}
-
-camera_init :: proc(
-	camera: ^Camera,
-	lookfrom := Point3{0, 0, 0},
-	lookat := Point3{0, 0, -1},
-	vup := Vec3{0, 1, 0},
-	vfov := math.PI / 2,
-) {
-	camera^ = {
-		lookfrom = lookfrom,
-		lookat   = lookat,
-		vup      = vup,
-		vfov     = vfov,
-	}
-	camera.center = camera.lookfrom
-}
-
-// TODO: multithread this
 get_ray_color :: proc(
 	ray: Ray,
 	tmin: f64 = 0.001, // NOTE: avoid shadow acne
