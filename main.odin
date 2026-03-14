@@ -119,9 +119,9 @@ Shared_Data :: struct {
 	progress:          ^Progress,
 	world:             ^World,
 }
-Thread_Data :: struct {
+Task_Data :: struct {
 	shared: ^Shared_Data,
-	id:     int,
+	buf:    []u8,
 }
 
 main :: proc() {
@@ -309,7 +309,11 @@ main :: proc() {
 		max = image.height,
 	}
 
-	threads: [THREAD_COUNT]^thread.Thread
+	pool: thread.Pool
+	thread.pool_init(&pool, arena_allocator, THREAD_COUNT)
+	thread.pool_start(&pool)
+	defer thread.pool_destroy(&pool)
+
 	shared_data := Shared_Data {
 		builder_total_len = &builder_total_len,
 		camera            = &camera,
@@ -320,41 +324,48 @@ main :: proc() {
 		viewport          = &viewport,
 		world             = &world,
 	}
-	thread_data: [THREAD_COUNT]Thread_Data
+	task_count := image.height
+	tasks := make([]Task_Data, task_count, arena_allocator)
+
+	buf_offset := shared_data.builder_total_len^
+	bytes_per_line := image.width * LINE_LEN
 
 	benchmark_start := time.now()
-	for i in 0 ..< len(threads) {
-		thread_data[i] = {
+	for i in 0 ..< task_count {
+		starting_byte := i * bytes_per_line + buf_offset
+		finishing_byte := (i + 1) * bytes_per_line + buf_offset
+		tasks[i] = {
 			shared = &shared_data,
-			id     = i,
+			buf    = image.buf[starting_byte:finishing_byte],
 		}
 
-		// Render image rows for each thread
-		threads[i] = thread.create(render_world)
-		threads[i].data = &thread_data[i]
-		thread.start(threads[i])
-	}
-	defer {
-		for i in 0 ..< len(threads) do thread.destroy(threads[i])
-	}
-
-	outer: for {
-		time.sleep(time.Millisecond * 500)
-		fmt.printf(
-			"\rProgress: [% 3d/% 3d] ",
-			progress.current,
-			progress.max,
-			flush = false,
+		thread.pool_add_task(
+			&pool,
+			mem.nil_allocator(),
+			render_world,
+			&tasks[i],
+			i,
 		)
-
-		for t in threads {
-			if !thread.is_done(t) {
-				continue outer
-			}
-		}
-		break outer
 	}
-	thread.join_multiple(..threads[:])
+
+	print_interval := time.now()
+	for {
+		if time.since(print_interval) >= time.Millisecond * 200 {
+			print_interval = time.now()
+			fmt.printf(
+				"\rProgress: [% 3d/% 3d] ",
+				progress.current,
+				progress.max,
+				flush = false,
+			)
+		}
+
+		_, _ = thread.pool_pop_done(&pool)
+		if thread.pool_is_empty(&pool) {
+			thread.pool_finish(&pool)
+			break
+		}
+	}
 	fmt.println()
 
 	fmt.println(builder_total_len)
@@ -367,92 +378,85 @@ main :: proc() {
 	fmt.println("Elapsed time:", time.since(benchmark_start))
 }
 
-render_world :: proc(t: ^thread.Thread) {
-	thread_data := cast(^Thread_Data)t.data
-	camera := thread_data.shared.camera
-	config := thread_data.shared.config
-	defocus_disk := thread_data.shared.defocus_disk
-	image := thread_data.shared.image
-	progress := thread_data.shared.progress
-	viewport := thread_data.shared.viewport
-	world := thread_data.shared.world
+render_world :: proc(task: thread.Task) {
+	line_idx := task.user_index
+	task_data := cast(^Task_Data)task.data
 
-	buf_offset := thread_data.shared.builder_total_len^
-	bytes_per_line := image.width * LINE_LEN
+	buf := task_data.buf
+	camera := task_data.shared.camera
+	config := task_data.shared.config
+	defocus_disk := task_data.shared.defocus_disk
+	image := task_data.shared.image
+	progress := task_data.shared.progress
+	viewport := task_data.shared.viewport
+	world := task_data.shared.world
 
-	for y := thread_data.id; y < image.height; y += THREAD_COUNT {
-		starting_byte := y * bytes_per_line + buf_offset
-		finishing_byte := (y + 1) * bytes_per_line + buf_offset
-		builder := strings.builder_from_slice(
-			image.buf[starting_byte:finishing_byte],
-		)
+	builder := strings.builder_from_slice(buf)
+	for x in 0 ..< image.width {
+		sampled_pixel: Color3
 
-		for x in 0 ..< image.width {
-			sampled_pixel: Color3
+		for _ in 0 ..< config.samples_per_pixel {
+			offset := Vec3{rand.float64() - 0.5, rand.float64() - 0.5, 0}
+			pixel_sample :=
+				viewport.first_pixel +
+				((f64(x) + offset.x) * viewport.delta.u) +
+				((f64(line_idx) + offset.y) * viewport.delta.v)
 
-			for _ in 0 ..< config.samples_per_pixel {
-				offset := Vec3{rand.float64() - 0.5, rand.float64() - 0.5, 0}
-				pixel_sample :=
-					viewport.first_pixel +
-					((f64(x) + offset.x) * viewport.delta.u) +
-					((f64(y) + offset.y) * viewport.delta.v)
-
-				// Initialize ray from camera center or random point in defocus disk
-				ray: Ray
-				if config.defocus_angle <= 0 {
-					ray.origin = camera.center
-				} else {
-					point: Point3
-					for {
-						point = {
-							rand.float64_range(-1, 1),
-							rand.float64_range(-1, 1),
-							0,
-						}
-						if linalg.length2(point) < 1 {
-							break
-						}
+			// Initialize ray from camera center or random point in defocus disk
+			ray: Ray
+			if config.defocus_angle <= 0 {
+				ray.origin = camera.center
+			} else {
+				point: Point3
+				for {
+					point = {
+						rand.float64_range(-1, 1),
+						rand.float64_range(-1, 1),
+						0,
 					}
-					ray.origin =
-						camera.center +
-						(point.x * defocus_disk.u) +
-						(point.y * defocus_disk.v)
+					if linalg.length2(point) < 1 {
+						break
+					}
 				}
-				ray.direction = pixel_sample - ray.origin
-
-				color := get_ray_color(
-					ray,
-					max_depth = config.max_depth,
-					world = world.objects[:],
-				)
-				sampled_pixel += color
+				ray.origin =
+					camera.center +
+					(point.x * defocus_disk.u) +
+					(point.y * defocus_disk.v)
 			}
+			ray.direction = pixel_sample - ray.origin
 
-			scaled_sampled_pixel := sampled_pixel * config.pixel_samples_scale
-			gamma_corrected_pixel: Color3
-			for pixel, index in scaled_sampled_pixel {
-				if pixel > 0 {
-					gamma_corrected_pixel[index] = math.sqrt(pixel)
-				}
-			}
-			pixel_color := linalg.to_int(
-				linalg.clamp(gamma_corrected_pixel, 0, 0.999) * 256,
+			color := get_ray_color(
+				ray,
+				max_depth = config.max_depth,
+				world = world.objects[:],
 			)
-			fmt.sbprintf(
-				&builder,
-				"% 3d % 3d % 3d\n",
-				pixel_color.r,
-				pixel_color.g,
-				pixel_color.b,
-			)
+			sampled_pixel += color
 		}
 
-		sync.atomic_add(
-			thread_data.shared.builder_total_len,
-			strings.builder_len(builder),
+		scaled_sampled_pixel := sampled_pixel * config.pixel_samples_scale
+		gamma_corrected_pixel: Color3
+		for pixel, index in scaled_sampled_pixel {
+			if pixel > 0 {
+				gamma_corrected_pixel[index] = math.sqrt(pixel)
+			}
+		}
+		pixel_color := linalg.to_int(
+			linalg.clamp(gamma_corrected_pixel, 0, 0.999) * 256,
 		)
-		sync.atomic_add(&progress.current, 1)
+		fmt.sbprintf(
+			&builder,
+			"% 3d % 3d % 3d\n",
+			pixel_color.r,
+			pixel_color.g,
+			pixel_color.b,
+		)
 	}
+
+	sync.atomic_add(
+		task_data.shared.builder_total_len,
+		strings.builder_len(builder),
+	)
+	sync.atomic_add(&progress.current, 1)
 }
 
 append_world :: proc(world: ^World, material: Material, object: Object) {
