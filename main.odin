@@ -5,11 +5,16 @@ import "core:math"
 import "core:math/linalg"
 import "core:math/rand"
 import "core:mem"
+import vmem "core:mem/virtual"
 import "core:os"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 
 FILENAME :: "image.ppm"
+LINE_LEN :: 12
+THREAD_COUNT :: 8
 F64_NEAR_ZERO :: 1e-8
 
 Color3 :: [3]f64
@@ -55,6 +60,12 @@ Viewport :: struct {
 	height:      f64,
 }
 
+Defocus_Disk :: struct {
+	radius: f64,
+	u:      Vec3, // horizontal radius
+	v:      Vec3, // vertical radius
+}
+
 Material_Kind :: enum {
 	LAMBERTIAN,
 	METALLIC,
@@ -65,6 +76,18 @@ Material :: struct {
 	fuzz:             f64,
 	refraction_index: f64,
 	kind:             Material_Kind,
+}
+
+Object :: struct {
+	center:   Point3,
+	radius:   f64,
+	material: ^Material,
+}
+
+World :: struct {
+	objects:   []Object,
+	materials: []Material,
+	len:       int,
 }
 
 Ray :: struct {
@@ -80,10 +103,25 @@ Ray_Intersection_Data :: struct {
 	has_hit:        bool,
 }
 
-Object :: struct {
-	center:   Point3,
-	radius:   f64,
-	material: ^Material,
+Progress :: struct {
+	current: int,
+	max:     int,
+}
+
+Shared_Data :: struct {
+	// The sum of all builders for each line
+	builder_total_len: ^int,
+	image:             ^Image,
+	config:            ^Config,
+	camera:            ^Camera,
+	viewport:          ^Viewport,
+	defocus_disk:      ^Defocus_Disk,
+	progress:          ^Progress,
+	world:             ^World,
+}
+Thread_Data :: struct {
+	shared: ^Shared_Data,
+	id:     int,
 }
 
 main :: proc() {
@@ -102,27 +140,33 @@ main :: proc() {
 	}
 	defer os.close(file)
 
+	arena: vmem.Arena
+	if err := vmem.arena_init_growing(&arena); err != nil {
+		fmt.eprintln("Error setting up arena:", err)
+	}
+	arena_allocator := vmem.arena_allocator(&arena)
+	defer vmem.arena_destroy(&arena)
+
 	// Initialize image
 	image: Image
 	{
 		image = {
 			aspect_ratio = 16.0 / 9.0,
-			width        = 400,
+			width        = 1200,
 		}
 		image.height = int(f64(image.width) / image.aspect_ratio)
 
-		line_len := 12
 		alloc_err: mem.Allocator_Error
 		image.buf, alloc_err = make(
 			[]u8,
-			line_len * image.height * image.width + 128,
+			LINE_LEN * image.height * image.width + 128,
+			arena_allocator,
 		)
 		if alloc_err != nil {
 			fmt.eprintln("Error allocating buffer for image:", alloc_err)
 			return
 		}
 	}
-	defer delete(image.buf)
 
 	builder := strings.builder_from_bytes(image.buf[:])
 	fmt.sbprintln(&builder, "P3") // ASCII
@@ -135,7 +179,7 @@ main :: proc() {
 	{
 		config = {
 			samples_per_pixel = 100,
-			defocus_angle     = 0,
+			defocus_angle     = math.PI / 300,
 			focus_distance    = 10,
 			max_depth         = 50,
 		}
@@ -146,10 +190,10 @@ main :: proc() {
 	camera: Camera
 	{
 		camera = {
-			lookfrom = {0, 0, 0},
-			lookat   = {0, 0, -1},
+			lookfrom = {13, 2, 3},
+			lookat   = {0, 0, 0},
 			vup      = {0, 1, 0},
-			vfov     = math.PI / 2,
+			vfov     = math.PI / 9,
 		}
 		camera.center = camera.lookfrom
 	}
@@ -179,54 +223,168 @@ main :: proc() {
 	viewport.first_pixel =
 		viewport_upper_left + 0.5 * (viewport.delta.u + viewport.delta.v)
 
-	defocus_radius :=
-		config.focus_distance * math.tan(config.defocus_angle / 2)
-	defocus_disk_u := basis_u * defocus_radius
-	defocus_disk_v := basis_v * defocus_radius
+	defocus_disk := Defocus_Disk {
+		radius = config.focus_distance * math.tan(config.defocus_angle / 2),
+	}
+	defocus_disk.u = basis_u * defocus_disk.radius
+	defocus_disk.v = basis_v * defocus_disk.radius
 
-	// Materials
-	ground := Material {
-		kind   = .LAMBERTIAN,
-		albedo = {0.8, 0.8, 0},
-	}
-	center_sphere := Material {
-		kind   = .LAMBERTIAN,
-		albedo = {0.1, 0.2, 0.5},
-	}
-	left_sphere := Material {
-		kind             = .DIELETRIC,
-		refraction_index = 1.5,
-	}
-	bubble := Material {
-		kind             = .DIELETRIC,
-		refraction_index = 1 / left_sphere.refraction_index,
-	}
-	right_sphere := Material {
-		kind   = .METALLIC,
-		albedo = {0.8, 0.6, 0.2},
-		fuzz   = 1,
+	MAX_OBJECTS :: 22 * 22 + 4
+	materials := make([]Material, MAX_OBJECTS, arena_allocator)
+	objects := make([]Object, MAX_OBJECTS, arena_allocator)
+	world := World {
+		materials = materials,
+		objects   = objects,
 	}
 
-	// Objects to be raytraced
-	world := [?]Object {
-		{center = Point3{0, -100.5, -1}, radius = 100, material = &ground},
-		{center = Point3{0, 0, -1.2}, radius = 0.5, material = &center_sphere},
-		{center = Point3{-1, 0, -1}, radius = 0.5, material = &left_sphere},
-		{center = Point3{-1, 0, -1}, radius = 0.4, material = &bubble},
-		{center = Point3{1, 0, -1}, radius = 0.5, material = &right_sphere},
+	// Ground
+	append_world(
+		&world,
+		Material{kind = .LAMBERTIAN, albedo = Color3{0.5, 0.5, 0.5}},
+		Object{center = Point3{0, -1000, 0}, radius = 1000},
+	)
+	for a in -11 ..< 11 {
+		for b in -11 ..< 11 {
+			// Smaller spheres
+			random_material := rand.float64()
+			center := Point3 {
+				f64(a) + 0.9 * rand.float64(),
+				0.2,
+				f64(b) + 0.9 * rand.float64(),
+			}
+
+			if (linalg.length(center - Point3{4, 0.2, 0}) > 0.9) {
+				small_sphere := Object {
+					center = center,
+					radius = 0.2,
+				}
+				small_sphere_material: Material
+				switch random_material {
+				case 0.0 ..< 0.8:
+					// lambertian
+					albedo := random_color() * random_color()
+					small_sphere_material = Material {
+						kind   = .LAMBERTIAN,
+						albedo = albedo,
+					}
+				case 0.8 ..< 0.95:
+					// metal
+					albedo := random_color(0.5, 1)
+					fuzz := rand.float64_range(0, 0.5)
+					small_sphere_material = Material {
+						kind   = .METALLIC,
+						albedo = albedo,
+						fuzz   = fuzz,
+					}
+				case:
+					// glass
+					small_sphere_material = Material {
+						kind             = .DIELETRIC,
+						refraction_index = 1.5,
+					}
+				}
+				append_world(&world, small_sphere_material, small_sphere)
+			}
+		}
+	}
+	// Bigger spheres
+	append_world(
+		&world,
+		Material{kind = .DIELETRIC, refraction_index = 1.5},
+		Object{center = Point3{0, 1, 0}, radius = 1},
+	)
+	append_world(
+		&world,
+		Material{kind = .LAMBERTIAN, albedo = Color3{0.4, 0.2, 0.1}},
+		Object{center = Point3{-4, 1, 0}, radius = 1},
+	)
+	append_world(
+		&world,
+		Material{kind = .METALLIC, albedo = Color3{0.7, 0.6, 0.5}, fuzz = 0},
+		Object{center = Point3{4, 1, 0}, radius = 1},
+	)
+
+	builder_total_len := strings.builder_len(builder)
+	progress := Progress {
+		max = image.height,
 	}
 
-	// Benchmark at the end
-	start := time.now()
+	threads: [THREAD_COUNT]^thread.Thread
+	shared_data := Shared_Data {
+		builder_total_len = &builder_total_len,
+		camera            = &camera,
+		config            = &config,
+		defocus_disk      = &defocus_disk,
+		image             = &image,
+		progress          = &progress,
+		viewport          = &viewport,
+		world             = &world,
+	}
+	thread_data: [THREAD_COUNT]Thread_Data
 
-	// Render image
-	// TODO: multithread this
-	for y in 0 ..< image.height {
+	benchmark_start := time.now()
+	for i in 0 ..< len(threads) {
+		thread_data[i] = {
+			shared = &shared_data,
+			id     = i,
+		}
+
+		// Render image rows for each thread
+		threads[i] = thread.create(render_world)
+		threads[i].data = &thread_data[i]
+		thread.start(threads[i])
+	}
+	defer {
+		for i in 0 ..< len(threads) do thread.destroy(threads[i])
+	}
+
+	outer: for {
+		time.sleep(time.Millisecond * 500)
 		fmt.printf(
 			"\rProgress: [% 3d/% 3d] ",
-			y + 1,
-			image.height,
+			progress.current,
+			progress.max,
 			flush = false,
+		)
+
+		for t in threads {
+			if !thread.is_done(t) {
+				continue outer
+			}
+		}
+		break outer
+	}
+	thread.join_multiple(..threads[:])
+	fmt.println()
+
+	fmt.println(builder_total_len)
+	if _, err := os.write(file, image.buf[:builder_total_len]); err != nil {
+		fmt.eprintfln("Error writing to %v: %v", FILENAME, err)
+		return
+	}
+
+	fmt.printfln("%v: %M written", FILENAME, builder_total_len)
+	fmt.println("Elapsed time:", time.since(benchmark_start))
+}
+
+render_world :: proc(t: ^thread.Thread) {
+	thread_data := cast(^Thread_Data)t.data
+	camera := thread_data.shared.camera
+	config := thread_data.shared.config
+	defocus_disk := thread_data.shared.defocus_disk
+	image := thread_data.shared.image
+	progress := thread_data.shared.progress
+	viewport := thread_data.shared.viewport
+	world := thread_data.shared.world
+
+	buf_offset := thread_data.shared.builder_total_len^
+	bytes_per_line := image.width * LINE_LEN
+
+	for y := thread_data.id; y < image.height; y += THREAD_COUNT {
+		starting_byte := y * bytes_per_line + buf_offset
+		finishing_byte := (y + 1) * bytes_per_line + buf_offset
+		builder := strings.builder_from_slice(
+			image.buf[starting_byte:finishing_byte],
 		)
 
 		for x in 0 ..< image.width {
@@ -257,15 +415,15 @@ main :: proc() {
 					}
 					ray.origin =
 						camera.center +
-						(point.x * defocus_disk_u) +
-						(point.y * defocus_disk_v)
+						(point.x * defocus_disk.u) +
+						(point.y * defocus_disk.v)
 				}
 				ray.direction = pixel_sample - ray.origin
 
 				color := get_ray_color(
 					ray,
 					max_depth = config.max_depth,
-					world = world[:],
+					world = world.objects[:],
 				)
 				sampled_pixel += color
 			}
@@ -280,24 +438,28 @@ main :: proc() {
 			pixel_color := linalg.to_int(
 				linalg.clamp(gamma_corrected_pixel, 0, 0.999) * 256,
 			)
-			fmt.sbprintln(
+			fmt.sbprintf(
 				&builder,
+				"% 3d % 3d % 3d\n",
 				pixel_color.r,
 				pixel_color.g,
 				pixel_color.b,
 			)
 		}
-	}
-	fmt.println()
 
-	builder_len := strings.builder_len(builder)
-	if _, err := os.write(file, image.buf[:builder_len]); err != nil {
-		fmt.eprintfln("Error writing to %v: %v", FILENAME, err)
-		return
+		sync.atomic_add(
+			thread_data.shared.builder_total_len,
+			strings.builder_len(builder),
+		)
+		sync.atomic_add(&progress.current, 1)
 	}
+}
 
-	fmt.printfln("%v: %M written", FILENAME, builder_len)
-	fmt.println("Elapsed time:", time.since(start))
+append_world :: proc(world: ^World, material: Material, object: Object) {
+	world.objects[world.len] = object
+	world.materials[world.len] = material
+	world.objects[world.len].material = &world.materials[world.len]
+	world.len += 1
 }
 
 get_ray_color :: proc(
@@ -448,6 +610,14 @@ random_unit_vector :: proc() -> (out: Vec3) {
 			out /= math.sqrt(out_len2)
 			return
 		}
+	}
+}
+
+random_color :: proc(low: f64 = 0, high: f64 = 1) -> Color3 {
+	return Color3 {
+		rand.float64_range(low, high),
+		rand.float64_range(low, high),
+		rand.float64_range(low, high),
 	}
 }
 
